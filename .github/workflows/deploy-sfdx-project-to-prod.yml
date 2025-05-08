@@ -125,7 +125,7 @@ on:
 
 jobs:
   deploy:
-    uses: wtax-class-actions/wtax-github-actions-workflows/.github/workflows/deploy-sfdx-project.yml@main
+    uses: wtax-class-actions/wtax-class-actions-github-reusable-workflows/.github/workflows/deploy-sfdx-project.yml@main
     with:
       instance-url: ${{ inputs.instance-url }}
       client-id: ${{ inputs.client-id }}
