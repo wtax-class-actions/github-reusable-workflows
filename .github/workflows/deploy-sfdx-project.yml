@@ -1,0 +1,338 @@
+on:
+  workflow_call:
+    inputs:
+      source-directory:
+        type: string
+        description: Directory containing the main source of the project. Usually force-app, but can be something else. This is used to determine which entry in packageDirectories in sfdx-project.json is the main one. Defaults to force-app.
+        required: false
+        default: force-app
+      instance-url:
+        type: string
+        description: Salesforce instance URL of the target org
+        required: true
+      client-id:
+        type: string
+        description: OAuth client ID (sometimes called consumer key) of the connected app on Salesforce used to connect to the target org
+        required: true
+      jwt-key-encrypted:
+        type: string
+        description: Ansible Vault-encrypted private key to connect to the target org with using the JWT flow. (This should be encrypted using ansible-vault encrypt, NOT ansible-vault encrypt_string!)
+        required: true
+      username:
+        type: string
+        description: Username of Salesforce user to authenticate as on the target org
+        required: true
+      run-tests:
+        type: boolean
+        description: Whether to run tests as part of the deployment. This is required when deploying to a production org.
+        required: true
+      destructive-changes-after-deployment:
+        type: boolean
+        description: Instruct Salesforce to apply destructive changes (i.e. deletes) after the deployment. This is the default. In some cases you may want to apply destructive changes before deploying. In that case, set this input to false.
+        required: false
+        default: true
+    secrets:
+      ansible-vault-password:
+        description: Password to be used to decrypt the `jwt-key-encrypted`.
+        required: true
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: print out inputs (for debugging purposes)
+        run: |
+          echo 'inputs.instance-url = ${{ inputs.instance-url }}' 
+          echo 'inputs.client-id = ${{ inputs.client-id }}' 
+          echo 'inputs.jwt-key-encrypted = ${{ inputs.jwt-key-encrypted }}' 
+          echo 'inputs.username = ${{ inputs.username }}' 
+          echo 'inputs.run-tests = ${{ inputs.run-tests }}'
+          echo 'inputs.destructive-changes-after-deployment = ${{ inputs.destructive-changes-after-deployment }}'
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out code
+        uses: actions/checkout@v4
+
+      - name: install jq
+        run: sudo apt-get install -y jq
+
+      - name: set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+
+      - name: install Salesforce CLI (sfdx)
+        run: npm list -g @salesforce/cli || npm install -g @salesforce/cli
+
+      - name: package the source as metadata
+        run: |
+          mkdir -p "target/${{ github.event.repository.name }}-${{ github.sha }}"
+          sf project convert source --source-dir "${{ inputs.source-directory }}" --output-dir="target/${{ github.event.repository.name }}-${{ github.sha }}"
+
+      - name: determine which components are marked for deletion (have a "//DELETE" line)
+        run: |
+          metadata_directory="target/${{ github.event.repository.name }}-${{ github.sha }}"
+          grep -rE '(^\/\/ *DELETE$|^<!-- *DELETE *-->)' "${metadata_directory}" | awk -F':' '{print $1}' | while read line; do
+            filename=`basename "$line"`
+            ext=${filename##*.}
+            component=`basename "$filename" .$ext`  # Strip off the extension and assume the base file name is the component's full name
+            if [ "${ext}" == "cls" ]; then  # Apex classes
+              type=ApexClass
+            elif [ "${ext}" == "trigger" ]; then  # Apex triggers
+              type=ApexTrigger
+            elif [ "${ext}" == "page" ]; then  # Visualforce pages
+              type=ApexPage
+            elif [ "${ext}" == "component" ]; then  # Visualforce components
+              type=ApexComponent
+            elif [ "${ext}" == "network" ]; then  # Network (digital experience)
+              type=Network
+            elif [ "${ext}" == "site" ]; then  # Site
+              type=Site
+            elif [ "${ext}" == "flow" ]; then  # Flow
+              type=Flow
+            else
+              type=Unknown
+            fi
+            echo "${line},${type},${component}"
+          done > target/deletes.csv
+          echo "`wc -l < target/deletes.csv` component(s) marked for deletion"
+
+      - name: archive deletes.csv
+        uses: actions/upload-artifact@v4
+        with:
+          name: deletes.csv
+          path: target/deletes.csv
+
+      - name: remove components marked as deleted from metadata
+        run: |
+          metadata_directory="target/${{ github.event.repository.name }}-${{ github.sha }}"
+          >target/deletes-apexClasses.txt
+          echo "Removing components marked as deleted from metadata directory..."
+
+          awk -F, '{print "path=\""$1"\" type=\""$2"\" fullName=\""$3"\""}' target/deletes.csv | while read line; do
+            eval $line
+            # Remove files
+            rm $path
+            if [ "$type" != "Flow" ]; then
+                rm $path-meta.xml
+            fi
+            # Remove component from package manifest.
+            # NOTE: This doesn't guarantee that the member is being removed (only) from the correct type section. E.g. 
+            #       if there is both an ApexClass and an AuraDefinitionBundle with the same full name and the ApexClass
+            #       was marked as deleted, this would also remove the AuraDefinitionBundle from the package manifest.
+            sed -i.bak "/<members>${fullName}<\\/members>/d" ${metadata_directory}/package.xml
+
+            # While we're looping over the components to be deleted; save just the Apex class names to a separate
+            # file. This will come in handy when determining which Apex tests there are in the project.
+            if [ "$type" == "ApexClass" ]; then
+              echo "${fullName}" >> target/deletes-apexClasses.txt
+            fi
+          done
+
+          rm -f ${metadata_directory}/package.xml.bak
+          echo "`wc -l <target/deletes.csv` components removed from metadata directory."
+
+      - name: find unit test classes in project
+        run: |
+          echo "Finding unit tests in project..."
+          find force-app/test -name '*.cls' | while read test; do
+            testClass="$(basename "${test}" .cls)"
+            grep "${testClass}" target/deletes-apexClasses.txt >/dev/null || echo "${testClass}" >>target/test-classes.txt
+          done
+
+      - name: archive test-classes.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-classes.txt
+          path: target/test-classes.txt
+
+      - name: archive metadata directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ github.event.repository.name }}-${{ github.sha }}.zip"
+          path: target/${{ github.event.repository.name }}-${{ github.sha }}
+
+  deploy:
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out code
+        uses: actions/checkout@v4
+
+      - name: install jq
+        run: sudo apt-get install -y jq
+
+      - name: set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+
+      - name: install Salesforce CLI
+        run: npm list -g @salesforce/cli || npm install -g @salesforce/cli
+
+      - name: create unsigned plugin allowlist
+        run: |
+          mkdir -p $HOME/.config/sf
+          echo '[ "@dxatscale/sfpowerscripts", "apex-code-coverage-transformer" ]' > $HOME/.config/sf/unsignedPluginAllowList.json
+
+      - name: write Ansible Vault password to file
+        run: echo "${{ secrets.ansible-vault-password }}" >.vault-password
+
+      - name: write encrypted JWT key to file
+        run: echo '${{ inputs.jwt-key-encrypted }}' >.jwt-key
+
+      - name: decrypt the private key for the Continuous Integration connected app
+        run: ansible-vault decrypt --vault-password-file=.vault-password .jwt-key
+
+      - name: connect to org
+        run: |
+          sf auth jwt grant \
+              --client-id="${{ inputs.client-id }}" \
+              --jwt-key-file=.jwt-key \
+              --instance-url=${{ inputs.instance-url }} \
+              --username=${{ inputs.username }} \
+              --set-default
+
+      - name: download metadata ZIP file
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ github.event.repository.name }}-${{ github.sha }}.zip"
+          path: "target/${{ github.event.repository.name }}"
+
+      - name: download deleted metadata CSV file
+        uses: actions/download-artifact@v4
+        with:
+          name: deletes.csv
+          path: target
+
+      - name: do destructive changes before deployment
+        run: |
+          echo destructiveChangeManifestFile=destructiveChangesPre.xml >>$GITHUB_ENV
+          echo destructiveChangeType=pre >>$GITHUB_ENV
+        if: ${{ !inputs.destructive-changes-after-deployment }}
+
+      - name: do destructive changes after deployment
+        run: |
+          echo destructiveChangeManifestFile=destructiveChangesPost.xml >>$GITHUB_ENV
+          echo destructiveChangeType=post >>$GITHUB_ENV
+        if: inputs.destructive-changes-after-deployment
+
+      - name: create destructive change manifest for components marked for deletion
+        run: |
+          echo "Creating destructive change manifest for components marked for deletion"
+
+          # Set some variables
+          target_org="${{ inputs.username }}"
+
+          # Get list of components on org
+          echo "- Getting list of components on org"
+          sf data query -t -o ${target_org} -q 'SELECT Name FROM ApexClass' --json | jq -r '.result.records[].Name' > target/org-apex-classes.txt
+          sf data query -t -o ${target_org} -q 'SELECT Name FROM ApexTrigger' --json | jq -r '.result.records[].Name' > target/org-apex-triggers.txt
+          sf data query -t -o ${target_org} -q 'SELECT Name FROM ApexPage' --json | jq -r '.result.records[].Name' > target/org-apex-pages.txt
+          sf data query -t -o ${target_org} -q 'SELECT Name FROM ApexComponent' --json | jq -r '.result.records[].Name' > target/org-apex-components.txt
+          sf data query -o ${target_org} -q 'SELECT Name FROM Network' --json | jq -r '.result.records[].Name' > target/org-networks.txt
+          sf data query -o ${target_org} -q 'SELECT Name FROM Site' --json | jq -r '.result.records[].Name' > target/org-sites.txt
+          sf data query -o ${target_org} -q 'SELECT DeveloperName FROM FlowDefinition' --usetoolingapi --json | jq -r '.result.records[].DeveloperName' > target/org-flows.txt
+
+          # Move components that still exist on org to delete/source
+          echo - Filtering components that still exist on org
+          >target/scheduled-for-destruction.txt
+          >target/already-destroyed.txt
+          >target/cannot-destroy.txt
+          awk -F, '{print "type=\""$2"\" fullName=\""$3"\""}' target/deletes.csv|while read line; do
+            eval $line
+            if [ "$type" == "ApexClass" ]; then
+              if grep "^${fullName}\$" target/org-apex-classes.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "ApexTrigger" ]; then
+              if grep "^${fullName}\$" target/org-apex-triggers.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "ApexPage" ]; then
+              if grep "^${fullName}\$" target/org-apex-pages.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "ApexComponent" ]; then
+              if grep "^${fullName}\$" target/org-apex-components.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "Network" ]; then
+              if grep "^${fullName}\$" target/org-networks.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "Site" ]; then
+              if grep "^${fullName}\$" target/org-sites.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            elif [ "$type" == "Flow" ]; then
+              if grep "^${fullName}\$" target/org-flows.txt; then
+                echo "    Scheduling ${type}:${fullName} for destruction"
+                echo "${type}:${fullName}" >>target/scheduled-for-destruction.txt
+              else
+                echo "${type}:${fullName}" >>target/already-destroyed.txt
+              fi
+            else
+              echo "${type}:${fullName}" >>target/cannot-destroy.txt
+              echo "    WARNING: Support for deleting components of metadata type ${type} not implemented yet (${type}:${fullName})."
+            fi
+          done
+          
+          scheduled_for_destruction=$(wc -l <target/scheduled-for-destruction.txt)
+          already_destroyed=$(wc -l <target/already-destroyed.txt)
+          cannot_destroy=$(wc -l <target/cannot-destroy.txt)
+          echo "${scheduled_for_destruction} component(s) to be deleted from org, ${already_destroyed} already deleted (cannot delete ${cannot_destroy})."
+          if [ ${scheduled_for_destruction} -gt 0 ]; then
+            echo "- Generating destructive change manifest..."
+            metadata_args=$(cat target/scheduled-for-destruction.txt|while read line; do echo -n "--metadata ${line} "; done)
+            sf project generate manifest ${metadata_args} --type ${destructiveChangeType} --output-dir=target/${{ github.event.repository.name }}
+            echo "Ok! Added ${scheduled_for_destruction} destructive changes to target/${{ github.event.repository.name }}/${destructiveChangeManifestFile}."
+          else
+            echo "No destructive changes to add."
+            cat <<EOF >target/${{ github.event.repository.name }}/${destructiveChangeManifestFile}
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Package xmlns="http://soap.sforce.com/2006/04/metadata" />
+          EOF
+          fi
+          echo
+
+      - name: download test classes file
+        uses: actions/download-artifact@v4
+        with:
+          name: test-classes.txt
+          path: target
+
+      - name: deploy to org and run Apex tests
+        run: |
+          timeout=180
+          testflags=$(cat target/test-classes.txt | while read testClass; do
+            echo -n "--tests=${testClass} "
+          done)
+          echo "Deploying to ${{ inputs.username }} and running unit tests... (timeout ${timeout} minutes)"
+          sf project deploy start --target-org="${{ inputs.username }}" --test-level=RunSpecifiedTests ${testflags}--coverage-formatters=json --results-dir=reports --metadata-dir="target/${{ github.event.repository.name }}" --wait=${timeout}
+
+      - name: archive target directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: target
+          path: target
+        if: always()

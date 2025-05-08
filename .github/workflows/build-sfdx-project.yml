@@ -1,0 +1,205 @@
+on:
+  workflow_call:
+    inputs:
+      source-directory:
+        type: string
+        description: Directory containing the main source of the project. Usually force-app, but can be something else. This is used to determine which entry in packageDirectories in sfdx-project.json is the main one. Defaults to force-app.
+        required: false
+        default: force-app
+      run-tests:
+        type: string
+        description: whether to run the unit tests in source-directory when deploying the code in source-directory. Set to anything other than "yes" to not run tests.
+        required: false
+        default: yes
+      instance-url:
+        type: string
+        description: Salesforce instance URL to log in to as Dev Hub org
+        required: false
+        default: https://login.salesforce.com
+      client-id:
+        type: string
+        description: OAuth client ID (sometimes called consumer key) of the connected app on Salesforce used to connect to the Dev Hub org
+        required: false
+        default: TODO
+      jwt-key-encrypted:
+        type: string
+        description: Ansible Vault-encrypted private key to connect to the Dev Hub org with using the JWT flow (this should be encrypted using ansible-vault encrypt, NOT ansible-vault encrypt_string!)
+        required: false
+        default: TODO
+      username:
+        type: string
+        description: Username of Salesforce user to authenticate as on the Dev Hub org; must have permission to create scratch orgs
+        required: false
+        default: TODO
+    secrets:
+      ansible-vault-password:
+        description: Password to be used to decrypt the `jwt-key-encrypted` and `texei-installation-keys`.
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: check out code
+        uses: actions/checkout@v4
+
+      - name: install jq
+        run: sudo apt-get install -y jq
+
+      - name: install ccrypt
+        run: sudo apt-get install -y ccrypt
+
+      - name: set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+
+      - name: write encrypted JWT key to file
+        run: echo '${{ inputs.jwt-key-encrypted }}' >.jwt-key
+
+      - name: write Ansible Vault password to file
+        run: echo "${{ secrets.ansible-vault-password }}" >.vault-password
+
+      - name: decrypt the private key for the Continuous Integration connected app
+        run: ansible-vault decrypt --vault-password-file=.vault-password .jwt-key
+
+      - name: install Salesforce CLI
+        run: npm list -g @salesforce/cli || npm install -g @salesforce/cli
+
+      - name: create unsigned plugin allowlist
+        run: |
+          mkdir -p $HOME/.config/sf
+          echo '[ "@dxatscale/sfpowerscripts", "texei-sfdx-plugin" ]' > $HOME/.config/sf/unsignedPluginAllowList.json
+
+      - name: install sfpowerscripts plugin
+        run: sf plugins install @dxatscale/sfpowerscripts
+
+      - name: install texei plugin
+        run: sf plugins install texei-sfdx-plugin
+
+      - name: connect to Dev Hub
+        run: |
+          sf auth jwt grant \
+              --client-id="${{ inputs.client-id }}" \
+              --jwt-key-file=.jwt-key \
+              --instance-url="${{ inputs.instance-url }}" \
+              --username="${{ inputs.username }}" \
+              --set-default-dev-hub \
+              --alias dev-hub
+
+      - name: create scratch org
+        run: sf org create scratch -w 15 -f config/project-scratch-def.json -d -y 1 --set-default --alias scratch-org
+
+      - name: write encrypted installation keys to file
+        run: echo '${{ inputs.texei-installation-keys-encrypted }}' >texei-installation-keys.txt
+        if: ${{ inputs.texei-installation-keys-encrypted != '' }}
+
+      - name: tell GitHub Actions to mask the installation keys in the log
+        run: echo "::add-mask::$(ansible-vault decrypt --vault-password-file=.vault-password --output - texei-installation-keys.txt)"
+        if: ${{ inputs.texei-installation-keys-encrypted != '' }}
+
+      - name: decrypt the installation keys
+        run: echo "texei_installation_keys_decrypted="$(ansible-vault decrypt --vault-password-file=.vault-password --output - texei-installation-keys.txt) >>$GITHUB_ENV
+        if: ${{ inputs.texei-installation-keys-encrypted != '' }}
+
+      - name: create installation key string from packageInstallationKeys section in sfdx-project.json
+        id: installationkeys
+        run: |
+          echo -n "installationkeys=">$GITHUB_OUTPUT
+          cat sfdx-project.json | jq -r '.packageInstallationKeys|to_entries[]|[.key,.value]|@tsv'| \
+          while read line; do
+            eval `echo "$line"|awk '{print "package="$1" encrypted_key="$2}'`
+            eval `echo $encrypted_key|awk -F: '{print "encryption_method="$1" encrypted_key="$2}'`
+            case $encryption_method in
+              ccrypt)
+                installation_key=`echo "$encrypted_key" | base64 --decode | ccat -k .vault-password`
+                ;;
+              plain)
+                installation_key="$encrypted_key"
+                ;;
+              *)
+                if [ "x$encrypted_key" == "x" ]; then
+                  # No encrypted key means there was no colon so key was plain text and encryption_method is actually the installation key
+                  installation_key="$encryption_method"
+                else
+                  echo "Unsupported encryption method '$encryption_method' for package $package"
+                  exit 3
+                fi
+                ;;
+            esac
+            echo -n "$package:$installation_key "
+          done >>$GITHUB_OUTPUT
+
+      - name: install dependencies using sfpowerscripts
+        run: sf dependency install -u scratch-org -v dev-hub --installationkeys "${{ steps.installationkeys.outputs.installationkeys }}"
+        if: ${{ inputs.texei-installation-keys-encrypted == ''}}
+
+      - name: install dependencies (with installation keys)
+        run: sf texei package dependencies install -w 15 -r --installationkeys="${texei_installation_keys_decrypted}"
+        if: ${{ inputs.texei-installation-keys-encrypted != '' }}
+
+      - name: run scripts
+        run: test -d scripts/build-hooks/pre-test && for file in scripts/build-hooks/pre-test/*.apex; do sfdx apex run -f "$file"; done || echo "No pre-test scripts to run."
+
+      - name: determine which Apex classes and triggers are marked for deletion (have a "//DELETE" line)
+        run: |
+          mkdir target
+          grep -r '^\/\/ *DELETE$' "${{ inputs.source-directory }}"|awk -F':' '{print $1}'|while read line; do
+            echo -n $line
+            filename=`basename $line`
+            ext=${filename##*.}
+            if [ "${ext}" == "cls" ]; then
+              apexClass=`basename $filename .cls`
+              echo ',ApexClass,'$apexClass
+            elif [ "${ext}" == "trigger" ]; then
+              apexTrigger=`basename $filename .trigger`
+              echo ',ApexTrigger,'$apexTrigger
+            fi
+          done >target/deletes.csv
+          echo "`wc -l <target/deletes.csv` component(s) marked for deletion"
+
+      - name: delete metadata marked as //DELETE
+        run: |
+          echo "Removing Apex classes and triggers marked as deleted from source directory..."
+          awk -F, '{print "path=\""$1"\" fullName=\""$3"\""}' target/deletes.csv|while read line; do
+            eval $line
+            echo Deleting $fullName
+            # Remove files
+            rm $path $path-meta.xml
+          done
+
+      - name: push sources to scratch org and run tests for source-directory
+        run: |
+          set -o pipefail
+          jq -r '.packageDirectories[].path' < sfdx-project.json | \
+          while read path; do
+            if [ $(find ${path} -name '*-meta.xml'|wc -l) -eq 0 ]; then
+              echo Skipping empty package directory ${path}
+            else
+              if [ "${path}" == "${{ inputs.source-directory }}" -a "${{ inputs.run-tests }}" == "yes" ]; then
+                testflags=$(find ${path}/test -name '*.cls' | while read test; do
+                  if ! grep -c '^\/\/ *DELETE$' "${test}" >/dev/null; then
+                    echo -n "--tests=`basename ${test} .cls` "
+                  fi
+                done)          
+                sf project deploy start --source-dir $path --ignore-conflicts --test-level=RunSpecifiedTests ${testflags}
+              else
+                sf project deploy start --source-dir $path --ignore-conflicts
+              fi
+            fi
+          done
+
+      - name: package the source as metadata
+        run: |
+          mkdir -p "target/${{ github.event.repository.name }}-${{ github.sha }}"
+          sf project convert source --source-dir "${{ inputs.source-directory }}" --output-dir="target/${{ github.event.repository.name }}-${{ github.sha }}"
+
+      - name: archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-${{ github.sha }}
+          path: target/${{ github.event.repository.name }}-${{ github.sha }}
+
+      - name: delete scratch org
+        run: sf org delete scratch -p
+        if: always()
